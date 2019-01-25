@@ -1,14 +1,15 @@
 package org.biodatageeks.preprocessing.coverage
 
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql._
+import org.apache.spark.sql.types.{IntegerType, StringType}
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.unsafe.types.UTF8String
-import org.biodatageeks.datasources.BAM.{BDGAlignFileReaderWriter}
+import org.biodatageeks.datasources.BAM.BDGAlignFileReaderWriter
 import org.biodatageeks.datasources.BDGInputDataType
 import org.biodatageeks.inputformats.BDGAlignInputFormat
 import org.biodatageeks.utils.{BDGInternalParams, BDGTableFuncs}
@@ -17,6 +18,7 @@ import org.seqdoop.hadoop_bam.{BAMBDGInputFormat, CRAMBDGInputFormat}
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
+import scala.util.Try
 
 
 class CoverageStrategy(spark: SparkSession) extends Strategy with Serializable  {
@@ -67,7 +69,7 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
     spark
       .sparkContext
       .getPersistentRDDs
-      .filter((t)=> t._2.name==BDGInternalParams.RDDEventsName)
+      .filter(t=> t._2.name==BDGInternalParams.RDDEventsName)
       .foreach(_._2.unpersist())
 
     val schema = plan.schema
@@ -164,7 +166,6 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
     }
 
     val covBroad = spark.sparkContext.broadcast(prepareBroadcast(acc.value()))
-
     lazy val reducedEvents = CoverageMethodsMos.upateContigRange(covBroad, events)
 
     val blocksResult = {
@@ -179,8 +180,17 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
     }
     val allPos = spark.sqlContext.getConf(BDGInternalParams.ShowAllPositions, "false").toBoolean
 
-    //check if it's a window length or a table name
-    val maybeWindowLength =
+    val targetType = target match {
+      case Some(t) => if (Try(t.toInt).isSuccess) {
+        IntegerType
+      } else {
+        StringType
+      }
+      case _ => None
+    } // determine if target is fixed length windows or windows from table
+
+
+    val windowLength =
       try {
               target match {
                 case Some(t) => Some(t.toInt)
@@ -191,32 +201,55 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
     }
 
 
-
     lazy val cov =
-      if(maybeWindowLength != None) //fixed-length window
-        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos,maybeWindowLength,None)
-
+      if (targetType.equals(IntegerType)) // fixed-length window
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, windowLength, None)
           .keyBy(_.key)
-          .reduceByKey((a,b) =>
-            CovRecordWindow(a.contigName,
-              a.start,
-              a.end,
-              (a.asInstanceOf[CovRecordWindow].overLap.get * a.asInstanceOf[CovRecordWindow].cov + b.asInstanceOf[CovRecordWindow].overLap.get * b.asInstanceOf[CovRecordWindow].cov )/
-                (a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get),
-              Some(a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get) ) )
+          .reduceByKey(
+            (a,b) =>
+              CovRecordWindow(
+                a.contigName,
+                a.start,
+                a.end,
+                (a.asInstanceOf[CovRecordWindow].overLap.get * a.asInstanceOf[CovRecordWindow].cov + b.asInstanceOf[CovRecordWindow].overLap.get * b.asInstanceOf[CovRecordWindow].cov) / (a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get),
+                Some(a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get)
+              )
+          )
           .map(_._2)
+      else if (targetType.equals(StringType)) {
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, None, target)
+          .keyBy(_.key)
+          .reduceByKey(
+            (a,b) =>
+              CovRecordWindow(
+                a.contigName,
+                a.start,
+                a.end,
+                (a.asInstanceOf[CovRecordWindow].overLap.get * a.asInstanceOf[CovRecordWindow].cov + b.asInstanceOf[CovRecordWindow].overLap.get * b.asInstanceOf[CovRecordWindow].cov) / (a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get),
+                Some(a.asInstanceOf[CovRecordWindow].overLap.get + b.asInstanceOf[CovRecordWindow].overLap.get)
+              )
+          )
+          .map(_._2)
+      }
+      else // blo
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, None, None)
 
-       else
-        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos,None, None)
-
-    if(maybeWindowLength != None) {   // windows
+    if (targetType.equals(IntegerType)) { // windows with fixed length
 
       cov.mapPartitions(p => {
         val proj = UnsafeProjection.create(schema)
         p.map(r => proj.apply(InternalRow.fromSeq(Seq(
           UTF8String.fromString(r.contigName), r.start, r.end, r.asInstanceOf[CovRecordWindow].cov))))
       })
-    } else { // regular blocks
+    }
+    else if (targetType.equals(StringType)) { // windows with targers from bed
+      cov.mapPartitions(p => {
+        val proj = UnsafeProjection.create(schema)
+        p.map(r => proj.apply(InternalRow.fromSeq(Seq(/*UTF8String.fromString(sampleId),*/
+          UTF8String.fromString(r.contigName), r.start, r.end, r.asInstanceOf[CovRecordWindow].cov))))
+      })
+    }
+    else { // regular blocks
       cov.mapPartitions(p => {
         val proj = UnsafeProjection.create(schema)
         p.map(r => proj.apply(InternalRow.fromSeq(Seq(/*UTF8String.fromString(sampleId),*/

@@ -93,7 +93,8 @@ object ResolveTableValuedFunctionsSeq extends Rule[LogicalPlan] {
       tvf("table" -> StringType, "sampleId" -> StringType, "result" -> StringType, "target" -> StringType)
       { case Seq(table: Any,sampleId:Any, result:Any, target: Any) =>
         BDGCoverage(table.toString,sampleId.toString,result.toString, Some(target.toString))
-      }),
+      }
+    ),
     "range" -> Map(
       /* range(end) */
       tvf("end" -> LongType) { case Seq(end: Long) =>

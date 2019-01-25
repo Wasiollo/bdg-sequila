@@ -2,12 +2,13 @@ package org.biodatageeks.preprocessing.coverage
 
 
 
-import htsjdk.samtools.{BAMFileReader, CigarOperator, SamReaderFactory, ValidationStringency}
-import org.apache.spark.rdd.RDD
-import scala.collection.mutable
-import htsjdk.samtools._
-import org.apache.spark.broadcast.Broadcast
+import htsjdk.samtools.{CigarOperator, _}
 import org.apache.log4j.Logger
+import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
+
+import scala.collection.mutable
 
 
 abstract class AbstractCovRecord {
@@ -209,8 +210,9 @@ object CoverageMethodsMos {
         var prevCov = 0
         var blockLength = 0
 
+        val targetsTab = targetsTable.getOrElse(None)
 
-        if (windowLength.isEmpty) { // BLOCKS & BASES (NON-WINDOW) COVERAGE CALCULATIONS
+        if (windowLength.isEmpty && targetsTable.isEmpty) { // BLOCKS & BASES (NON-WINDOW) COVERAGE CALCULATIONS
           ind = addFirstBlock(contig, contigMinMap(contig)._1, posShift, blocksResult, allPos, ind, result)  // add first block if necessary (if current positionshift is equal to the earliest read in the contig)
 
           while (i < covArrayLength) {
@@ -237,7 +239,8 @@ object CoverageMethodsMos {
 
           result.take(ind).iterator
 
-        } else {          // FIXED - WINDOW COVERAGE CALCULATIONS
+        } else if (windowLength.isDefined && targetsTable.isEmpty){          // FIXED - WINDOW COVERAGE CALCULATIONS
+
           while (i < covArrayLength) {
             cov += r._2._1(i)
 
@@ -261,6 +264,84 @@ object CoverageMethodsMos {
           ind = addLastWindow(contig, windowLength, posShift, i, covSum, cov, ind, result)
 
           result.take(ind).iterator
+
+        } else {
+
+          val session = SparkSession.builder().getOrCreate()
+
+          val targets = session.sql(s"SELECT * FROM ${targetsTab}")
+
+          val targetsCount = targets.count
+          val targetsRowCollection = targets.rdd.map(x => x).collect()
+          for (j <- 0 until targetsCount.toInt) {
+            val row = targetsRowCollection(j)
+
+            val targetContig = row(0).asInstanceOf[String]
+            val targetStart = row(1).asInstanceOf[Int]
+            val targetEnd = row(2).asInstanceOf[Int]
+
+            val targetId = row(3).asInstanceOf[String]
+
+            val previousTargetContig =
+              if (j > 0) targetsRowCollection(j - 1)(0).asInstanceOf[String]
+              else targetContig
+
+            val previousTargetEnd =
+              if (j > 0 && previousTargetContig == targetContig) targetsRowCollection(j - 1)(2).asInstanceOf[Int]
+              else 0
+
+            if (previousTargetContig != targetContig) {
+              covSum = 0
+              cov = 0
+
+            }
+
+            val windowLen = targetEnd - targetStart + 1
+            if (targetContig == contig) {
+
+              if (targetStart > previousTargetEnd) { //shift over gap
+                for (k <- previousTargetEnd + 1 until targetStart) {
+                  if (k - posShift + 1 < covArrayLength && k - posShift + 1 >= 0) {
+                    cov += r._2._1(k - posShift + 1)
+                  }
+                  covSum = cov
+                }
+              } else {
+                for (k <- previousTargetEnd until targetStart - 1 by -1) { // shift back -> targets are crossing
+                  if (k - posShift + 1 < covArrayLength && k - posShift + 1 >= 0) {
+                    cov -= r._2._1(k - posShift + 1)
+                  }
+                }
+                covSum = cov
+              }
+
+              for (i <- targetStart to targetEnd) {
+                val iter = i - posShift + 1
+                if (iter < covArrayLength && iter >= 0) {
+                  cov += r._2._1(iter)
+
+                  if (i == targetEnd && i > 0) {
+                    val length =
+                      if (iter < windowLen) iter
+                      else windowLen
+
+                    result(ind) = CovRecordWindow(targetContig, targetStart, targetEnd, covSum / length.toFloat, Some(length))
+
+                    ind += 1
+                    covSum = 0
+                  }
+                  covSum += cov
+                }
+                else if (iter == covArrayLength) {
+                  ind = addLastWindow(contig, Some(windowLen), posShift, iter, covSum, cov, ind, result)
+                  covSum = 0
+                }
+              }
+            }
+          }
+
+          result.take(ind).iterator
+
         }
 
       })
