@@ -54,6 +54,9 @@ case class UpdateStruct(
                          shrink:mutable.HashMap[(String,Int),(Int)],
                          minmax:mutable.HashMap[String,(Int,Int)]
                        )
+case class UpdateSumStruct(
+                         upd:mutable.HashMap[(String,Int), mutable.HashMap[Int, Int]]
+                       )
 
 
 
@@ -165,8 +168,48 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
       UpdateStruct(updateMap, shrinkMap, minmax)
     }
 
-    val covBroad = spark.sparkContext.broadcast(prepareBroadcast(acc.value()))
-    lazy val reducedEvents = CoverageMethodsMos.upateContigRange(covBroad, events)
+    def prepareSumBroadcast(a: CovSumUpdate, reducedEvents: RDD[(String, (Array[Short], Int, Int, Int, Int))]) = {
+
+      val contigRanges = a.sumArray
+      val updateArray = reducedEvents
+      val updateMap = new mutable.HashMap[(String, Int), mutable.HashMap[Int, Int]]()
+
+      contigRanges.foreach {
+        c =>
+          val contig = c.contigName
+
+          val filteredResult = updateArray
+            .filter(f => f._1 == c.contigName && f._2._2 == c.maxPos)
+
+          if (!filteredResult.isEmpty()) {
+            val currentRDD=filteredResult
+              .first()
+            val firstElem = currentRDD
+              ._2
+              ._1(0)
+
+            var tempElem = firstElem.toInt - currentRDD._2._5 // remove change of first elem
+            var cumSum = 0
+
+            c.cov.reverse.foreach(x => {
+              tempElem -= x
+              cumSum += tempElem
+            })
+
+            val startPoint = c.maxPos - c.cov.length
+
+            var currentHashMap = if (!updateMap.contains((contig, c.maxPos)))
+              new mutable.HashMap[Int, Int]()
+            else
+              updateMap((contig, c.maxPos))
+
+            currentHashMap += startPoint -> cumSum
+            updateMap += (contig, c.maxPos) -> currentHashMap
+          }
+      }
+
+      UpdateSumStruct(updateMap)
+    }
 
     val blocksResult = {
       result.toLowerCase() match {
@@ -179,6 +222,7 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
       }
     }
     val allPos = spark.sqlContext.getConf(BDGInternalParams.ShowAllPositions, "false").toBoolean
+    val optimizeWindow = spark.sqlContext.getConf(BDGInternalParams.OptimizationWindow, "false").toBoolean
 
     val targetType = target match {
       case Some(t) => if (Try(t.toInt).isSuccess) {
@@ -197,16 +241,66 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
                 case _ => None
               }
       } catch {
-        case e: Exception => None
+        case _: Exception => None
     }
+
+    val targetVal =
+      if (targetType.equals(IntegerType))
+        windowLength
+      else if (targetType.equals(StringType))
+        target
+      else
+        None
+
+    val covBroad = spark.sparkContext.broadcast(prepareBroadcast(acc.value()))
+
+    lazy val reducedEvents = CoverageMethodsMos.upateContigRange(covBroad, events)
+
+    val covSumUpdate = new CovSumUpdate(new ArrayBuffer[RightCovSumEdge]())
+    val covSumAcc = new CovSumAccumulatorV2(covSumUpdate)
+
+    spark
+      .sparkContext
+      .register(covSumAcc, "CoverageSumAcc")
+
+    reducedEvents
+      .persist(StorageLevel.MEMORY_AND_DISK)
+      .foreach(x => {
+        val maxC = x._2._2 + x._2._1.length - 1
+        if (!targetType.equals(StringType)) {
+          val maxCounter = if (targetType.equals(IntegerType))
+            maxC % windowLength.get
+          else // Blocks and bases for faster computing
+            1
+          val rightCovSumEdge = RightCovSumEdge(x._1, maxC, x._2._1.takeRight(maxCounter))
+          val rightCovSumUpdate = new CovSumUpdate(ArrayBuffer(rightCovSumEdge))
+          covSumAcc.add(rightCovSumUpdate)
+        } else { //Targets from table
+          val targetsTab = target.get
+          val session = SparkSession.builder().getOrCreate()
+          val crossingTargets = session.sql(s"SELECT * FROM ${targetsTab} WHERE start < ${maxC} AND end > ${maxC} AND contigName = '${x._1}'")
+          crossingTargets
+            .collect()
+            .foreach(targetRow => {
+              val maxCounter = maxC - targetRow.get(1).asInstanceOf[Int]
+              val rightCovSumEdge = RightCovSumEdge(x._1, maxC, x._2._1.takeRight(maxCounter))
+              val rightCovSumUpdate = new CovSumUpdate(ArrayBuffer(rightCovSumEdge))
+              covSumAcc.add(rightCovSumUpdate)
+            })
+        }
+      })
+
+    lazy val covSumBroad = spark.sparkContext.broadcast(prepareSumBroadcast(covSumAcc.value(), reducedEvents))
+
+    lazy val reducedSumEvents = CoverageMethodsMos.upateContigSumRange(covSumBroad, reducedEvents)
 
 
     lazy val cov =
-      if (targetType.equals(IntegerType)) // fixed-length window
-        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, windowLength, None)
+      if (targetType.equals(IntegerType) && !optimizeWindow) // fixed-length window
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedSumEvents, covBroad.value.minmax, blocksResult, allPos, windowLength, None)
           .keyBy(_.key)
           .reduceByKey(
-            (a,b) =>
+            (a, b) =>
               CovRecordWindow(
                 a.contigName,
                 a.start,
@@ -216,11 +310,11 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
               )
           )
           .map(_._2)
-      else if (targetType.equals(StringType)) {
-        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, None, target)
+      else if (targetType.equals(StringType) && !optimizeWindow) {
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedSumEvents, covBroad.value.minmax, blocksResult, allPos, None, target)
           .keyBy(_.key)
           .reduceByKey(
-            (a,b) =>
+            (a, b) =>
               CovRecordWindow(
                 a.contigName,
                 a.start,
@@ -231,8 +325,12 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
           )
           .map(_._2)
       }
-      else // blo
-        CoverageMethodsMos.eventsToCoverage(sampleId, reducedEvents, covBroad.value.minmax, blocksResult, allPos, None, None)
+      else if (targetType.equals(IntegerType) && optimizeWindow)
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedSumEvents, covBroad.value.minmax, blocksResult, allPos, windowLength, None)
+      else if (targetType.equals(StringType) && optimizeWindow)
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedSumEvents, covBroad.value.minmax, blocksResult, allPos, None, target)
+      else
+        CoverageMethodsMos.eventsToCoverage(sampleId, reducedSumEvents, covBroad.value.minmax, blocksResult, allPos, None, None)
 
     if (targetType.equals(IntegerType)) { // windows with fixed length
 
@@ -242,7 +340,7 @@ case class BDGCoveragePlan [T<:BDGAlignInputFormat](plan: LogicalPlan, spark: Sp
           UTF8String.fromString(r.contigName), r.start, r.end, r.asInstanceOf[CovRecordWindow].cov))))
       })
     }
-    else if (targetType.equals(StringType)) { // windows with targers from bed
+    else if (targetType.equals(StringType)) { // windows with targets from bed
       cov.mapPartitions(p => {
         val proj = UnsafeProjection.create(schema)
         p.map(r => proj.apply(InternalRow.fromSeq(Seq(/*UTF8String.fromString(sampleId),*/

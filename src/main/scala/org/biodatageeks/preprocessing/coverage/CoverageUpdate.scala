@@ -48,3 +48,46 @@ class CoverageAccumulatorV2(var covAcc: CovUpdate) extends AccumulatorV2[CovUpda
   }
 }
 
+case class RightCovSumEdge(contigName: String, maxPos: Int, cov: Array[Short])
+
+
+class CovSumUpdate(var sumArray: ArrayBuffer[RightCovSumEdge]) extends Serializable {
+
+  def reset(): Unit = {
+    sumArray = new ArrayBuffer[RightCovSumEdge]()
+  }
+
+  def add(p: CovSumUpdate): CovSumUpdate = {
+    sumArray = sumArray ++ p.sumArray
+    return this
+  }
+
+}
+
+class CovSumAccumulatorV2(var covAcc: CovSumUpdate) extends AccumulatorV2[CovSumUpdate, CovSumUpdate] {
+
+  def reset(): Unit = {
+    covAcc = new CovSumUpdate(new ArrayBuffer[RightCovSumEdge]())
+  }
+
+  def add(v: CovSumUpdate): Unit = {
+    covAcc.add(v)
+  }
+
+  def value(): CovSumUpdate = {
+    return covAcc
+  }
+
+  def isZero(): Boolean = {
+    return covAcc.sumArray.isEmpty
+  }
+
+  def copy(): CovSumAccumulatorV2 = {
+    return new CovSumAccumulatorV2(covAcc)
+  }
+
+  def merge(other: AccumulatorV2[CovSumUpdate, CovSumUpdate]) = {
+    covAcc.add(other.value)
+  }
+}
+

@@ -32,6 +32,7 @@ ss.sql(s"""
              |OPTIONS (path "${bedPath}", delimiter "\t")""".stripMargin)
 
 ss.sqlContext.setConf("spark.biodatageeks.bam.predicatePushdown","true")
+ss.sqlContext.setConf("spark.biodatageeks.window.optimization", "true")
 
 val queries = Array(
   BDGQuery("bdg_seq_count_NA12878","SELECT COUNT(*) FROM reads WHERE sampleId='NA12878'"),
@@ -48,7 +49,8 @@ val queries = Array(
       |     )
       |     GROUP BY targets.contigName,targets.start,targets.end
     """.stripMargin),
-  BDGQuery("bdg_cov_window_fix_length_100_count_NA12878","SELECT COUNT(*) FROM bdg_coverage ('reads','NA12878', 'bases','500')")
+  BDGQuery("bdg_cov_window_fix_length_100_count_NA12878","SELECT COUNT(*) FROM bdg_coverage ('reads','NA12878', 'blocks','500')"),
+  BDGQuery("bdg_cov_window_bed_file_targets_count_NA12878", "SELECT COUNT(*) FROM bdg_coverage ('reads', 'NA12878', 'blocks', 'targets')")
 )
 
 BDGPerfRunner.run(ss,queries)

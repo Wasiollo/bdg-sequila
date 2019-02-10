@@ -7,6 +7,7 @@ import org.apache.log4j.Logger
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
+import org.biodatageeks.utils.BDGInternalParams
 
 import scala.collection.mutable
 
@@ -172,7 +173,6 @@ object CoverageMethodsMos {
       val winLen = windowLength.get
       val windowStart =  ( (i+posShift) / winLen)  * windowLength.get
       val windowEnd = windowStart + winLen - 1
-      //          val lastWindowLength = (i + posShift) % winLen  // (i + posShift -1) % winLen // -1 current
       val lastWindowLength = (i + posShift) % winLen - 1 // HACK to fix last window (omit last element)
       sum -= cov   // HACK to fix last window (substract last element)
 
@@ -182,7 +182,26 @@ object CoverageMethodsMos {
     indexShift
   }
 
-  def eventsToCoverage(sampleId:String, events: RDD[(String,(Array[Short],Int,Int,Int))],
+  @inline def addLastOptimizedWindow(contig: String, contigMax: Int, windowLength: Option[Int], posShift: Int, i:Int, covSum: Int, cov: Int, ind: Int, result: Array[AbstractCovRecord]) = {
+    var indexShift = ind
+    var sum = covSum
+
+    if ((i + posShift - 1) == contigMax) { // add last window
+      val winLen = windowLength.get
+      val windowStart = ((i + posShift) / winLen) * winLen
+      val windowEnd = windowStart + winLen
+      val lastWindowLength = (i + posShift) % winLen - 1// HACK to fix last window (omit last element)
+      sum -= cov // HACK to fix last window (substract last element)
+
+      result(ind) = CovRecordWindow(contig, windowStart, windowEnd, sum / lastWindowLength.toFloat, Some(lastWindowLength))
+
+      indexShift += 1
+    }
+
+    indexShift
+  }
+
+  def eventsToCoverage(sampleId:String, events: RDD[(String, (Array[Short], Int, Int, Int, mutable.HashMap[Int, Int]))],
                        contigMinMap: mutable.HashMap [String,(Int,Int)],
                        blocksResult:Boolean, allPos: Boolean, windowLength: Option[Int], targetsTable:Option[String]) : RDD[AbstractCovRecord] = {
     events
@@ -209,6 +228,9 @@ object CoverageMethodsMos {
         var i = 0
         var prevCov = 0
         var blockLength = 0
+
+        val session = SparkSession.builder().getOrCreate()
+        val optimizeWindow = session.sqlContext.getConf(BDGInternalParams.OptimizationWindow,"false")
 
         val targetsTab = targetsTable.getOrElse(None)
 
@@ -239,8 +261,7 @@ object CoverageMethodsMos {
 
           result.take(ind).iterator
 
-        } else if (windowLength.isDefined && targetsTable.isEmpty){          // FIXED - WINDOW COVERAGE CALCULATIONS
-
+        } else if (windowLength.isDefined && targetsTable.isEmpty && optimizeWindow == "false") {          // FIXED - WINDOW COVERAGE CALCULATIONS
           while (i < covArrayLength) {
             cov += r._2._1(i)
 
@@ -252,6 +273,7 @@ object CoverageMethodsMos {
                 val winLen = windowLength.get
                 val windowStart = (((i + posShift) / winLen) - 1) * winLen
                 val windowEnd = windowStart + winLen - 1
+
                 result(ind) = CovRecordWindow(contig, windowStart, windowEnd, covSum / length.toFloat, Some(length))
                 covSum = 0
                 ind += 1
@@ -264,7 +286,120 @@ object CoverageMethodsMos {
           ind = addLastWindow(contig, windowLength, posShift, i, covSum, cov, ind, result)
 
           result.take(ind).iterator
+        } else if (windowLength.isDefined && targetsTable.isEmpty && optimizeWindow == "true"){ // optimized fixed windows
+          while (i < covArrayLength) {
+            cov += r._2._1(i)
 
+            if ((i + posShift) % windowLength.get == 0 && (i + posShift) > 0) {
+              var length =
+                if (i < windowLength.get) i
+                else windowLength.get
+
+              val winLen = windowLength.get
+              val windowStart = (((i + posShift) / winLen) - 1) * winLen
+              val windowEnd = windowStart + winLen - 1
+              if (r._2._5.contains(windowStart)) {
+                covSum += r._2._5(windowStart)
+                length = winLen
+              }
+
+              result(ind) = CovRecordWindow(contig, windowStart, windowEnd, covSum / length.toFloat, Some(length))
+              covSum = 0
+              ind += 1
+            }
+
+            covSum += cov
+            i += 1
+
+          }
+
+          ind = addLastOptimizedWindow(contig, contigMinMap(contig)._2, windowLength, posShift, i, covSum, cov, ind, result)
+
+          result.take(ind).iterator
+
+        } else if (windowLength.isEmpty && targetsTable.isDefined && optimizeWindow == "true"){
+
+          val session = SparkSession.builder().getOrCreate()
+
+          val targets = session.sql(s"SELECT * FROM ${targetsTab}")
+
+          val targetsCount = targets.count
+          val targetsRowCollection = targets.rdd.map(x => x).collect()
+          for (j <- 0 until targetsCount.toInt) {
+            val row = targetsRowCollection(j)
+
+            val targetContig = row(0).asInstanceOf[String]
+            val targetStart = row(1).asInstanceOf[Int]
+            val targetEnd = row(2).asInstanceOf[Int]
+
+            val targetId = row(3).asInstanceOf[String]
+
+            val previousTargetContig =
+              if (j > 0) targetsRowCollection(j - 1)(0).asInstanceOf[String]
+              else targetContig
+
+            val previousTargetEnd =
+              if (j > 0 && previousTargetContig == targetContig) targetsRowCollection(j - 1)(2).asInstanceOf[Int]
+              else 0
+
+            if (previousTargetContig != targetContig) {
+              covSum = 0
+              cov = 0
+
+            }
+
+            val windowLen = targetEnd - targetStart + 1
+            if (targetContig == contig) {
+
+              if (targetStart > previousTargetEnd) { //shift over gap
+                for (k <- previousTargetEnd + 1 until targetStart) {
+                  if (k - posShift + 1 < covArrayLength && k - posShift + 1 >= 0) {
+                    cov += r._2._1(k - posShift + 1)
+                  }
+                  covSum = cov
+                }
+              } else {
+                for (k <- previousTargetEnd until targetStart - 1 by -1) { // shift back -> targets are crossing
+                  if (k - posShift + 1 < covArrayLength && k - posShift + 1 >= 0) {
+                    cov -= r._2._1(k - posShift + 1)
+                  }
+                }
+                covSum = cov
+              }
+
+              for (i <- targetStart to targetEnd) {
+                val iter = i - posShift + 1
+                if (iter < covArrayLength && iter >= 0) {
+                  cov += r._2._1(iter)
+
+                  if (i == targetEnd && i > 0) {
+                    var length =
+                      if (iter < windowLen) iter
+                      else windowLen
+
+                    if (length < windowLen) {
+                      if (r._2._5.contains(targetStart)) {
+                        covSum += r._2._5(targetStart)
+                        length = windowLen
+                      }
+                    }
+
+                    result(ind) = CovRecordWindow(targetContig, targetStart, targetEnd, covSum / length.toFloat, Some(length))
+
+                    ind += 1
+                    covSum = 0
+                  }
+                  covSum += cov
+                }
+                else if (iter == covArrayLength) {
+                  ind = addLastOptimizedWindow(contig, contigMinMap(contig)._2, Some(windowLen), posShift, iter, covSum, cov, ind, result)
+                  covSum = 0
+                }
+              }
+            }
+          }
+
+          result.take(ind).iterator
         } else {
 
           val session = SparkSession.builder().getOrCreate()
@@ -355,12 +490,14 @@ object CoverageMethodsMos {
        val upd = b.value.upd
        val shrink = b.value.shrink
        val(contig,(eventsArray,minPos,maxPos,contigLength,maxCigarLength)) = c // to REFACTOR
+       var beginChange = 0
 
        val updArray = upd.get( (contig,minPos) ) match { // check if there is a value for contigName and minPos in upd, returning array of coverage and cumSum to update current contigRange
          case Some((arr,covSum)) => { // array of covs and cumSum
            arr match {
              case Some(overlapArray) => {
                var i = 0
+               beginChange = eventsArray(0)
                eventsArray(i) = (eventsArray(i) + covSum).toShort // add cumSum to zeroth element
 
                while (i < overlapArray.length) {
@@ -385,8 +522,23 @@ object CoverageMethodsMos {
          }
          case None => updArray
        }
-       (contig, (shrinkArray, minPos, maxPos, contigLength) )
+       (contig, (shrinkArray, minPos, maxPos, contigLength, beginChange) )
      }
    }
+  }
+
+  def upateContigSumRange(b:Broadcast[UpdateSumStruct],reducedEvents: RDD[(String,(Array[Short],Int,Int,Int,Int))]) = {
+    reducedEvents.map{
+      c => {
+        val upd = b.value.upd
+
+        val (contig, (eventsArray, minPos, maxPos, contigLength, firstEvent)) = c // to REFACTOR
+
+        if(upd.get( (contig,minPos) ).nonEmpty)
+          (contig, (eventsArray, minPos, maxPos, contigLength, upd((contig, minPos))))
+        else
+          (contig, (eventsArray, minPos, maxPos, contigLength, new mutable.HashMap[Int, Int]()))
+      }
+    }
   }
 }

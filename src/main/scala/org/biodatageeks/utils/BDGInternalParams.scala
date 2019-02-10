@@ -21,4 +21,6 @@ object BDGInternalParams {
   final val RDDEventsName = "spark.biodatageeks.events"
 
   final val InputSplitSize = "spark.biodatageeks.bam.splitSize"
+
+  final val OptimizationWindow = "spark.biodatageeks.window.optimization"
 }
